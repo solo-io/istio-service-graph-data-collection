@@ -8,171 +8,313 @@ To properly design, validate, and performance test the service graph, both inter
 
 This guide explains how to collect and share the required data sample.
 
-# Solo Enterprise Mesh  Setup
+I have been able to successfully complete the following instructions using the developers AWS account. It takes about 30 - 40 minutes to run this test process. Most of these steps are setting up the test environment and would not be needed in a real environment, but having sufficient IAM permissions in the environment will be important.
 
-This document describes how to set up Solo Enterprise Mesh v3 in production environments and for local development.
+# ClickHouse Backup to S3 (AWS/EKS)
 
-Larger customers may need to configure a PVC to handle storage requirements, [PVC can be configured as part of the chart](https://github.com/solo-io/kagent-enterprise/blob/main/charts/management/values.yaml#L478-L480), which accepts these values
+Step-by-step instructions for backing up ClickHouse data to S3 using [Altinity clickhouse-backup](https://github.com/Altinity/clickhouse-backup) on an EKS cluster with IRSA authentication.
 
-```
-persistentVolume:
-  # -- Enable persistent storage for ClickHouse
-  # @section -- Storage
-  enabled: false
-  # -- Storage class to use for persistent volumes (uses default if empty)
-  # @section -- Storage
-  storageClass: ""
-  # -- Size of persistent volume for ClickHouse data
-  # @section -- Storage
-  size: 20Gi
+---
 
-```
+## Prerequisites
 
-## Production environment
+- AWS CLI, kubectl, helm, eksctl installed
+- AWS credentials with EKS + IAM + S3 permissions
 
-In a production environment, the transport between the management plane and agent components must be secured using Istio. This is especially critical for multi-cluster setups where the connectivity traverses the internet. Using Istio to secure the transport layer can be skipped for demo or testing purposes.
+## 1. Set Environment Variables
 
-Set common environment variables:
 ```bash
-# e.g. 0.3.3
-export SOLO_ENT_VERSION=<solo-enterprise version>
-export MGMT_CLUSTER=<management cluster name>
-export MGMT_KUBE_CTX=<management kube context>
-# if workload cluster is different from management cluster
-export WORKLOAD_CLUSTER=<workload cluster name>
-export WORKLOAD_KUBE_CTX=<workload kube context>
+export SOLO_ENT_VERSION="0.3.5"   # adjust to your version
+export CLUSTER_NAME="<your-eks-cluster>"
+export AWS_REGION="us-east-1"
+export NAMESPACE="solo-enterprise"
+export RELEASE_NAME="management"
+export CH_STS="${RELEASE_NAME}-clickhouse-shard0"
+export CH_POD="${CH_STS}-0"
+export CH_SA="${RELEASE_NAME}-clickhouse"
+export S3_BUCKET="<your-s3-bucket>"
+export MGMT_KUBE_CTX="${CLUSTER_NAME}"
 ```
 
-1. Install Istio in the management and workload clusters. Provision a shared root of trust across the clusters as per Istio's multi-cluster setup instructions.
+## 2. (Optional) Create EKS Cluster
 
-2. Enable Ambient mode and multi-cluster peering in both clusters (skip for single cluster):
+Skip this step if you already have an EKS cluster. Set `CLUSTER_NAME` and `MGMT_KUBE_CTX` to match your existing cluster.
+
 ```bash
-for ctx in ${MGMT_KUBE_CTX} ${WORKLOAD_KUBE_CTX}; do
-  istioctl multicluster expose --namespace istio-system --context $ctx
-  kubectl label namespace solo-enterprise istio.io/dataplane-mode=ambient --context $ctx
-done
-
-# Multi-cluster only (skip for single cluster):
-
-# link clusters
-istioctl multicluster link --namespace istio-system --contexts=${MGMT_KUBE_CTX},${WORKLOAD_KUBE_CTX}
-
-# check status after linking
-istioctl multicluster check --context ${MGMT_KUBE_CTX}
-istioctl multicluster check --context ${WORKLOAD_KUBE_CTX}
+eksctl create cluster \
+  --name "${CLUSTER_NAME}" \
+  --region "${AWS_REGION}" \
+  --version 1.31 \
+  --nodegroup-name workers \
+  --node-type m5.xlarge \
+  --nodes 2 \
+  --managed
 ```
 
-3. Install the management plane:
+This takes ~15-20 minutes. Then set kubeconfig:
+
 ```bash
-helm upgrade -i management oci://us-docker.pkg.dev/solo-public/solo-enterprise-helm/charts/management --version ${SOLO_ENT_VERSION} -n solo-enterprise --create-namespace --kube-context ${MGMT_KUBE_CTX} -f - <<EOF
+aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --alias "${CLUSTER_NAME}"
+```
+
+Install the EBS CSI driver addon (required for persistent volumes on EKS):
+
+```bash
+eksctl create addon --name aws-ebs-csi-driver \
+  --cluster "${CLUSTER_NAME}" --region "${AWS_REGION}" --force
+```
+
+Set `gp2` as the default StorageClass (eksctl doesn't do this automatically):
+
+```bash
+kubectl --context "${MGMT_KUBE_CTX}" annotate storageclass gp2 \
+  storageclass.kubernetes.io/is-default-class=true
+```
+
+## 3. (Optional) Install Management Plane
+
+Skip if the management Helm chart is already installed. **Important**: ClickHouse must have persistent storage enabled with an explicit `storageClass`.
+
+```bash
+helm upgrade -i "${RELEASE_NAME}" \
+  oci://us-docker.pkg.dev/solo-public/solo-enterprise-helm/charts/management \
+  --version "${SOLO_ENT_VERSION}" \
+  --namespace "${NAMESPACE}" \
+  --create-namespace \
+  --kube-context "${MGMT_KUBE_CTX}" \
+  -f - <<EOF
 products:
   mesh:
     enabled: true
-cluster: ${MGMT_CLUSTER}
+cluster: mgmt
+clickhouse:
+  persistentVolume:
+    enabled: true
+    size: 20Gi
+    storageClass: gp2
 EOF
 ```
 
-4. Expose the management plane services to the agents (multi-cluster only):
+Wait for ClickHouse:
+
 ```bash
-kubectl --context ${MGMT_KUBE_CTX} label svc solo-enterprise-ui -n solo-enterprise solo.io/service-scope=global
-kubectl --context ${MGMT_KUBE_CTX} label svc solo-enterprise-telemetry-gateway -n solo-enterprise solo.io/service-scope=global
+kubectl --context "${MGMT_KUBE_CTX}" -n "${NAMESPACE}" \
+  wait --for=condition=ready pod/${CH_POD} --timeout=300s
 ```
 
-5. Retrieve information from the management plane:
+## 4. Create S3 Bucket
+
 ```bash
-# kubectl --context ${MGMT_KUBE_CTX} get svc -n solo-enterprise solo-enterprise-ui -o=jsonpath='{.status.loadBalancer.ingress[0].ip}'
-# or
-# kubectl --context ${MGMT_KUBE_CTX} get svc -n solo-enterprise solo-enterprise-ui -o=jsonpath='{.status.loadBalancer.ingress[0].hostname}'
-# or
-# when using Istio multi-cluster: solo-enterprise-ui.solo-enterprise.mesh.internal
-export TUNNEL_SERVER_FQDN=<external IP or hostname of solo-enterprise-ui service in mgmt cluster>
-# kubectl --context ${MGMT_KUBE_CTX} get svc -n solo-enterprise solo-enterprise-telemetry-gateway -o=jsonpath='{.status.loadBalancer.ingress[0].ip}'
-# or
-# kubectl --context ${MGMT_KUBE_CTX} get svc -n solo-enterprise solo-enterprise-telemetry-gateway -o=jsonpath='{.status.loadBalancer.ingress[0].hostname}'
-# or
-# when using Istio multi-cluster: solo-enterprise-telemetry-gateway.solo-enterprise.mesh.internal
-export TELEMETRY_GATEWAY_FQDN=<external IP or hostname of solo-enterprise-telemetry-gateway service in mgmt cluster>
+aws s3api create-bucket --bucket "${S3_BUCKET}" --region "${AWS_REGION}"
 ```
 
-6. Install the relay/agent component if the workloads are in a different cluster:
+> For regions other than `us-east-1`, add `--create-bucket-configuration LocationConstraint=${AWS_REGION}`.
+
+## 5. Set Up IRSA (IAM Roles for Service Accounts)
+
+### 5a. Associate OIDC provider
+
 ```bash
-helm upgrade -i relay oci://us-docker.pkg.dev/solo-public/solo-enterprise-helm/charts/relay --version ${SOLO_ENT_VERSION} -n solo-enterprise --create-namespace --kube-context ${WORKLOAD_KUBE_CTX} -f - <<EOF
-cluster: ${WORKLOAD_CLUSTER}
-tunnel:
-  fqdn: ${TUNNEL_SERVER_FQDN}
-  port: 9000
-telemetry:
-  fqdn: ${TELEMETRY_GATEWAY_FQDN}
-EOF
+eksctl utils associate-iam-oidc-provider \
+  --cluster "${CLUSTER_NAME}" --region "${AWS_REGION}" --approve
 ```
 
-7. Attach the backup sidecar to ClickHouse. **This has to happen right after installation** as patching the StatefulSet recreates it:
+### 5b. Get OIDC and account info
 
+```bash
+export OIDC_ISSUER=$(aws eks describe-cluster --name "${CLUSTER_NAME}" \
+  --region "${AWS_REGION}" --query "cluster.identity.oidc.issuer" --output text)
+export OIDC_ID=$(echo "${OIDC_ISSUER}" | sed 's|https://||')
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
 ```
-kubectl --context ${MGMT_KUBE_CTX} patch statefulset solo-enterprise-management-clickhouse-shard0 -n solo-enterprise --type='strategic' -p '{
-  "spec": {
-    "template": {
-      "spec": {
-        "containers": [
-          {
-            "name": "clickhouse-backup",
-            "image": "altinity/clickhouse-backup:latest",
-            "command": ["clickhouse-backup", "server"],
-            "env": [
-              {"name": "CLICKHOUSE_HOST", "value": "127.0.0.1"},
-              {"name": "CLICKHOUSE_PORT", "value": "9000"},
-              {"name": "CLICKHOUSE_USER", "value": "default"},
-              {"name": "CLICKHOUSE_PASSWORD", "value": "password"}
-            ],
-            "ports": [
-              {"name": "backup-api", "containerPort": 7171}
-            ],
-            "volumeMounts": [
-              {"name": "data", "mountPath": "/var/lib/clickhouse"}
-            ]
-          }
-        ]
-      }
+
+### 5c. Create IAM policy
+
+```bash
+aws iam create-policy --policy-name "ch-backup-s3-policy" \
+  --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Action": ["s3:PutObject","s3:GetObject","s3:DeleteObject","s3:ListBucket","s3:GetBucketLocation"],
+      "Resource": ["arn:aws:s3:::'${S3_BUCKET}'","arn:aws:s3:::'${S3_BUCKET}'/*"]
+    }]
+  }'
+export POLICY_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:policy/ch-backup-s3-policy"
+```
+
+### 5d. Create IAM role with trust policy
+
+```bash
+export ROLE_NAME="ch-backup-role"
+aws iam create-role --role-name "${ROLE_NAME}" \
+  --assume-role-policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": {"Federated": "arn:aws:iam::'${AWS_ACCOUNT_ID}':oidc-provider/'${OIDC_ID}'"},
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {"StringEquals": {
+        "'${OIDC_ID}':sub": "system:serviceaccount:'${NAMESPACE}':'${CH_SA}'",
+        "'${OIDC_ID}':aud": "sts.amazonaws.com"
+      }}
+    }]
+  }'
+aws iam attach-role-policy --role-name "${ROLE_NAME}" --policy-arn "${POLICY_ARN}"
+export ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${ROLE_NAME}"
+```
+
+### 5e. Annotate the ClickHouse ServiceAccount
+
+```bash
+kubectl --context "${MGMT_KUBE_CTX}" -n "${NAMESPACE}" annotate sa "${CH_SA}" \
+  "eks.amazonaws.com/role-arn=${ROLE_ARN}"
+```
+
+## 6. Patch ClickHouse StatefulSet with clickhouse-backup Sidecar
+
+```bash
+kubectl --context "${MGMT_KUBE_CTX}" -n "${NAMESPACE}" \
+  patch statefulset "${CH_STS}" --type='json' \
+  -p='[{
+    "op": "add",
+    "path": "/spec/template/spec/containers/-",
+    "value": {
+      "name": "clickhouse-backup",
+      "image": "altinity/clickhouse-backup:latest",
+      "imagePullPolicy": "IfNotPresent",
+      "command": ["clickhouse-backup", "server"],
+      "env": [
+        {"name": "CLICKHOUSE_HOST", "value": "127.0.0.1"},
+        {"name": "CLICKHOUSE_PORT", "value": "9000"},
+        {"name": "CLICKHOUSE_USERNAME", "value": "default"},
+        {"name": "CLICKHOUSE_PASSWORD", "value": "password"},
+        {"name": "REMOTE_STORAGE", "value": "s3"},
+        {"name": "S3_BUCKET", "value": "'${S3_BUCKET}'"},
+        {"name": "S3_REGION", "value": "'${AWS_REGION}'"},
+        {"name": "S3_PATH", "value": "clickhouse-backups"},
+        {"name": "S3_ACL", "value": ""},
+        {"name": "AWS_REGION", "value": "'${AWS_REGION}'"}
+      ],
+      "ports": [{"name": "backup-api", "containerPort": 7171}],
+      "volumeMounts": [{"name": "data", "mountPath": "/var/lib/clickhouse"}]
     }
-  }
-}'
+  }]'
 ```
 
-8. Wait for 6 hours to accumulate telemetry. If the data is too much, decrease this wait period.
+Wait for rollout:
 
-9. Trigger backup creation:
-
-```
-kubectl --context ${MGMT_KUBE_CTX} exec -n solo-enterprise solo-enterprise-management-clickhouse-shard0-0 \
-  -c clickhouse-backup -- clickhouse-backup create "backup-$(date +%Y%m%d-%H%M%S)"
+```bash
+kubectl --context "${MGMT_KUBE_CTX}" -n "${NAMESPACE}" \
+  rollout status statefulset/${CH_STS} --timeout=300s
 ```
 
-10. Get the name of the previously created backup:
+Verify sidecar (expect `2/2 Running`):
 
+```bash
+kubectl --context "${MGMT_KUBE_CTX}" -n "${NAMESPACE}" get pod ${CH_POD}
 ```
-kubectl --context ${MGMT_KUBE_CTX} -n solo-enterprise solo-enterprise-management-clickhouse-shard0-0 \
+
+If collecting data in a real environment, at this point wait for the duration of the test before proceeding with the following steps.
+
+## 7. Create Backup
+
+```bash
+export BACKUP_NAME="backup-$(date +%Y%m%d-%H%M%S)"
+kubectl --context "${MGMT_KUBE_CTX}" exec -n "${NAMESPACE}" "${CH_POD}" \
+  -c clickhouse-backup -- clickhouse-backup create "${BACKUP_NAME}"
+```
+
+Verify:
+
+```bash
+kubectl --context "${MGMT_KUBE_CTX}" exec -n "${NAMESPACE}" "${CH_POD}" \
   -c clickhouse-backup -- clickhouse-backup list local
 ```
 
-11. Copy the backup with the name that you found in previous step:
+## 8. Upload Backup to S3
 
+```bash
+kubectl --context "${MGMT_KUBE_CTX}" exec -n "${NAMESPACE}" "${CH_POD}" \
+  -c clickhouse-backup -- clickhouse-backup upload "${BACKUP_NAME}"
 ```
+
+Verify in S3:
+
+```bash
+aws s3 ls "s3://${S3_BUCKET}/clickhouse-backups/" --recursive | head -20
+```
+
+## 9. Download Backup from S3
+
+```bash
 mkdir -p ~/clickhouse-backups
-kubectl --context ${MGMT_KUBE_CTX} cp \
-  solo-enterprise/solo-enterprise-management-clickhouse-shard0-0:/var/lib/clickhouse/backup/<BACKUP_NAME> \
-  ~/clickhouse-backups/<BACKUP_NAME> \
-  -c clickhouse
+aws s3 cp "s3://${S3_BUCKET}/clickhouse-backups/${BACKUP_NAME}/" \
+  ~/clickhouse-backups/${BACKUP_NAME}/ --recursive
 ```
 
-12. Archive the backup:
+## 10. Alternative: Local Copy from Pod
 
-```
-kubectl --context ${MGMT_KUBE_CTX} exec -n solo-enterprise solo-enterprise-management-clickhouse-shard0-0 -c clickhouse -- \
-  tar czf - -C /var/lib/clickhouse/backup backup-20260115-123053 \
-  > ~/clickhouse-backups/backup-20260115-123053.tar.gz
+### Direct copy
+
+```bash
+kubectl --context "${MGMT_KUBE_CTX}" cp \
+  "${NAMESPACE}/${CH_POD}:/var/lib/clickhouse/backup/${BACKUP_NAME}" \
+  ~/clickhouse-backups/${BACKUP_NAME}-local \
+  -c clickhouse-backup
 ```
 
-## Backup to Cloud Storage
-Altinity Clickhouse backup tool also includes configuration to persist backups to remote file storage (S3, GCS, SFTP, FTP). This is preferable to local backup.
-https://github.com/Altinity/clickhouse-backup?tab=readme-ov-file#configurable-parameters
+### Tar archive
+
+```bash
+kubectl --context "${MGMT_KUBE_CTX}" exec -n "${NAMESPACE}" "${CH_POD}" -c clickhouse -- \
+  tar czf - -C /var/lib/clickhouse/backup "${BACKUP_NAME}" \
+  > ~/clickhouse-backups/${BACKUP_NAME}.tar.gz
+```
+
+## 11. Restore from Backup
+
+To restore to the **same** ClickHouse instance, use `--restore-database-mapping` to avoid UUID collisions with the Atomic database engine:
+
+```bash
+# Restore to a "restored" database (avoids UUID collision with existing tables)
+kubectl --context "${MGMT_KUBE_CTX}" exec -n "${NAMESPACE}" "${CH_POD}" \
+  -c clickhouse-backup -- clickhouse-backup restore \
+  --restore-database-mapping "default:restored" "${BACKUP_NAME}"
+```
+
+To restore to a **fresh** ClickHouse instance (no existing tables), restore directly:
+
+```bash
+# Download from S3 first if needed
+kubectl --context "${MGMT_KUBE_CTX}" exec -n "${NAMESPACE}" "${CH_POD}" \
+  -c clickhouse-backup -- clickhouse-backup download "${BACKUP_NAME}"
+
+# Restore all tables
+kubectl --context "${MGMT_KUBE_CTX}" exec -n "${NAMESPACE}" "${CH_POD}" \
+  -c clickhouse-backup -- clickhouse-backup restore "${BACKUP_NAME}"
+```
+
+## (Optional) Cleanup
+
+```bash
+# Delete local backup files
+rm -rf ~/clickhouse-backups/${BACKUP_NAME}*
+
+# Empty and delete S3 bucket
+aws s3 rm "s3://${S3_BUCKET}" --recursive
+aws s3api delete-bucket --bucket "${S3_BUCKET}" --region "${AWS_REGION}"
+
+# Detach and delete IAM role/policy
+aws iam detach-role-policy --role-name "${ROLE_NAME}" --policy-arn "${POLICY_ARN}"
+aws iam delete-role --role-name "${ROLE_NAME}"
+aws iam delete-policy --policy-arn "${POLICY_ARN}"
+
+# Uninstall Helm release and delete PVCs
+helm uninstall "${RELEASE_NAME}" --namespace "${NAMESPACE}" --kube-context "${MGMT_KUBE_CTX}"
+kubectl --context "${MGMT_KUBE_CTX}" -n "${NAMESPACE}" delete pvc --all
+
+# Delete EKS cluster (includes OIDC provider cleanup, ~10-15 min)
+eksctl delete cluster --name "${CLUSTER_NAME}" --region "${AWS_REGION}"
+```
 
