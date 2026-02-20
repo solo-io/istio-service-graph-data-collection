@@ -8,8 +8,6 @@ To properly design, validate, and performance test the service graph, both inter
 
 This guide explains how to collect and share the required data sample.
 
-I have been able to successfully complete the following instructions using the developers AWS account. It takes about 30 - 40 minutes to run this test process. Most of these steps are setting up the test environment and would not be needed in a real environment, but having sufficient IAM permissions in the environment will be important.
-
 # ClickHouse Backup to S3 (AWS/EKS)
 
 Step-by-step instructions for backing up ClickHouse data to S3 using [Altinity clickhouse-backup](https://github.com/Altinity/clickhouse-backup) on an EKS cluster with IRSA authentication.
